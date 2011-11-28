@@ -1,153 +1,256 @@
 """
 Main PCAP interface for listening on the NIC for data
+
 """
-from socket import ntohs
-from struct import unpack
-from Queue import Queue
-
-import memcache
+import logging
 import pcap
+from socket import ntohs, IPPROTO_TCP, IPPROTO_UDP
+import struct
 
-# Data buffers so we lose as little data as possible
-raw_data_buffer = str()
-tcp_data_buffer = str()
+from . import memcache
 
-# Queue for popping decoded tcp data back to the memcache data aggregator
-_data_queue = None
+# Ethernet constants
+_ETHERTYPE_IPV4 = '\x08\x00'
 
-# We'll toggle this when we start processing and when stop_listening is called
-_process_device = False
+# IPv4 Constants
+_IPV4_BASE_HEADER_SIZE = 20 # Default IPv4 header size
+_IPV4_OPTIONS_OFFSET = 20  # Bit 160
 
+# TCP Constants
+_TCP_BASE_HEADER_SIZE = 24
 
-def tcp_packet_to_dict(packet_in):
-    """
-    Decode an inbound IP packet and build a dictionary of data points
-    @TODO examine this function, make sure we're not losing data by
-    not looking for the packet end. In addition figure out why packet['data']
-    is including what I can only assume is the TCP header
-    """    
-    packet = dict()
-    packet['version'] = (ord(packet_in[0]) & 0xf0) >> 4
-    packet['header_len'] = ord(packet_in[0]) & 0x0f
-    packet['tos'] = ord(packet_in[1])
-    packet['total_len'] = ntohs(unpack('H', packet_in[2:4])[0])
-    packet['id'] = ntohs(unpack('H', packet_in[4:6])[0])
-    packet['flags'] = (ord(packet_in[6]) & 0xe0) >> 5
-    packet['fragment_offset'] = ntohs(unpack('H', packet_in[6:8])[0] & 0x1f)
-    packet['ttl'] = ord(packet_in[8])
-    packet['protocol'] = ord(packet_in[9])
-    packet['checksum'] = ntohs(unpack('H', packet_in[10:12])[0])
-    packet['source_address'] = pcap.ntoa(unpack('i', packet_in[12:16])[0])
-    packet['destination_address'] = pcap.ntoa(unpack('i', packet_in[16:20])[0])
-    
-    # If our header size is more than 5 bytes, we have options
-    if packet['header_len'] > 5:
-        packet['options'] = packet_in[20:4 * (packet['header_len'] - 5)]
-    else:
-        packet['options'] = None
-        
-    # Append the rest of the packet data to our data element
-    packet['data'] = packet_in[4 * packet['header_len']:]
-    
-    # Return the packet and how much data we have used of it
-    return packet, len(packet_in)
+# Port we want to use by default
+_MEMCACHED_PORT = 11211
+
+# How many bytes to read
+_SNAPSHOT_LENGTH = 65535
+
+# Doesn't do anything in Linux
+_TIMEOUT = 100
 
 
-def process_raw_data(data_in):
-    """
-    Take raw socket data and look for full ip packets, dispatching them to
-    the handler when received
-    """
-    global raw_data_buffer, tcp_data_buffer
-    
-    # Append our raw_data_buffer with our new data
-    raw_data_buffer += data_in
-    
-    # Make sure we have enough data to build a packet
-    if len(raw_data_buffer) < 15:
-        
-        # We don't so loop knowing our module level buffer is filled
-        return
-    
-    # Make sure with have an IP packet before continuing
-    if raw_data_buffer[12:14] == '\x08\x00':
-        
-        # Get a packet from our data, ignoring the IP header
-        packet_data, bytes_removed = tcp_packet_to_dict(raw_data_buffer[14:])
+class TCPCapture(object):
 
-        # Update our raw data global buffer
-        raw_data_buffer = str()
+    def __init__(self, queue, device, port=_MEMCACHED_PORT):
+        """Create a new TCPCapture object for the given device and port.
 
-        # Decode the packet data into hex values
-        hex_bytes = map(lambda x: '%.2x' % x, map(ord, packet_data['data']))
+        :param Queue queue: The cross-thread queue to create
+        :param str device: The device name (eth0, en1, etc)
+        :param int port: The port to listen on
+        :raises: ValueError
 
-        # Decode the hex bytes into a parable string via a list intermediary
-        data = list();
+        """
+        self._logger = logging.getLogger('menwith.network.TCPCapture')
+        self._logger.debug('Setup with queue: %r', queue)
+        self._queue = queue
+        self._running = False
 
-        # Start at the offset of the TCP header, ignoring the last 2 bytes
-        # However this doesn't make sense since our previous function is
-        # Supposed to not be returning the header in the data payload
-        # @TODO figure that part out
-        for x in range(decoded['header_len'] + 27, len(hex_bytes) - 2):
-            data.append('%c' % decoded['data'][x])
+        # Create the PCAP object
+        self._pcap = self._setup_libpcap(device, port)
 
-        # Append our tcp data buffer
-        tcp_data_buffer += ''.join(data)
-        
-        # Attempt to process our tcp data buffer
-        remove_len = menwith.memcache.parse_raw_data(tcp_data_buffer)
-        
-        # Remove the processed data from our buffer
-        tcp_data_buffer = tcp_buffer_data[remove_len:]
+    def _char_conversion(self, value):
+        """Convert the bytes to a character returning the converted string.
 
+        :param str value: The string to convert
+        :returns: str
 
-def stop_listening():
-    """
-    Causes the blocking listen call to stop
-    """
-    global _process_device
-    
-    # If we called _process_device without listening assert it
-    if not _process_device:
-        assert False, "Device is not processing"
-    
-    # Toggle the bool looped on in the listen method
-    _process_device = False
-    
+        """
+        return ''.join(['%c' % byte for byte in value])
 
-def listen(device, port=11211, queue=None):
-    """
-    Pass in a local device and port to listen on to grab packets for decoding
-    """
-    global _process_device, _data_queue
-    
-    # Make sure we're not processing already, prevent multi-threaded use
-    if _process_devide:
-        raise Exception("Can not process more than one device at a time")
-    
-    # Assign our data queue
-    _data_queue = queue
-    
-    # @TODO Lookup the purpose of the command and return values
-    net, mask = pcap.lookupnet(device)
+    def _ethernet_decode(self, packet_in):
+        """Extract the ethernet header, returning the ethernet header and
+        the remaining parts of the packet.
 
-    # Create our PCAP object for parsing packets    
-    p = pcap.pcapObject()
-    
-    # @TODO Look up these parameters and their meaning
-    p.open_live(dev, 1600, 0, 100)
+        :param str packet_in: The full packet
+        :returns: tuple
 
-    # Create our pcap filter looking for ip packets for the memcached server
-    p.setfilter('dst port %i' % port, 0, 0)
+        """
+        return (self._format_bytes(packet_in[0:6], ':'),
+                self._format_bytes(packet_in[6:12], ':'),
+                packet_in[12:14],
+                packet_in[14:])
 
-    # Set our operation to non-blocking
-    p.setnonblock(True)
+    def _format_bytes(self, value, delimiter=''):
+        """Format a byte string returning the formatted value with the
+        specified delimiter.
 
-    # Toggle our flag that we're actively processing
-    _process_device = True
+        :param str value: The byte string
+        :param str delimiter: The optional delimiter
+        :returns: str
 
-    # Loop until stop_listening is called
-    while _process_device:
-    
-      # When we receive data from pcap, process it
-      p.dispatch(1, process_raw_data)
+        """
+        return delimiter.join(['%0.2x' % ord(byte) for byte in value])
+
+    def _ipv4_decode(self, packet_in):
+        """Extract the IP header and populate a dictionary of values, returning
+        a the dictionary and the remaining data to extract.
+
+        :param str packet_in: The IP packet data
+        :returns: tuple
+
+        """
+        out = {'version': struct.unpack('b', packet_in[0])[0] >> 4,
+               'ihl': (struct.unpack('b', packet_in[0])[0] & 0x0F) * 4,
+               'total_length': ntohs(struct.unpack('H', packet_in[2:4])[0]),
+               'identification': ntohs(struct.unpack('H', packet_in[4:6])[0]),
+               'flags': (ord(packet_in[6]) & 0xe0) >> 5,
+               'fragment_offset': (ntohs(struct.unpack('H',
+                                                       packet_in[6:8])[0]) &
+                                   0x1f),
+               'ttl': ord(packet_in[8]),
+               'protocol': ord(packet_in[9]),
+               'checksum': ntohs(struct.unpack('H', packet_in[10:12])[0]),
+               'source': pcap.ntoa(struct.unpack('i', packet_in[12:16])[0]),
+               'destination': pcap.ntoa(struct.unpack('i',
+                                                      packet_in[16:20])[0])}
+
+        # If our header size is more than 5 bytes, we have options
+        if out['ihl'] > _IPV4_BASE_HEADER_SIZE:
+            out['options'] = packet_in[_IPV4_BASE_HEADER_SIZE:out['ihl']]
+        else:
+            out['options'] = None
+
+        # Return the decoded packet
+        return out, packet_in[out['ihl']:]
+
+    def _process_packet(self, packet_length, packet_in, timestamp):
+        """Called by libpcap's dispatch call, we receive raw data that needs
+        to be decoded then appended to the tcp buffer. When a full IP packet
+        is received, construct the TCP header dictionary.
+
+        :param int packet_length: The length of the packet received
+        :param str packet_in: The packet to be processed
+        :param float timestamp: The timestamp the packet was received
+
+        """
+        # Extract the parts of the packet
+        dest, source, ethertype, payload = self._ethernet_decode(packet_in)
+        self._logger.debug(('Destination MAC Address: %s '
+                            'Source MAC Address: %s'), dest, source)
+
+        # If we have an IPv4 ethertype, process it
+        if ethertype == _ETHERTYPE_IPV4:
+
+            # Process the IPv4 Header
+            ipv4_header, ipv4_payload = self._ipv4_decode(payload)
+
+            # Log the IPv4 Header values
+            self._logger.debug('IPv4 Header: %r', ipv4_header)
+
+            # Determine how to decode
+            if ipv4_header['protocol'] == IPPROTO_TCP:
+
+                # Decode the TCP Header
+                tcp_header, tcp_payload = self._tcp_decode(ipv4_payload)
+
+                # Log the TCP Header values
+                self._logger.debug('TCP Header: %r', tcp_header)
+
+                # Add the TCP data to the Queue for decoding
+                if tcp_payload:
+                    self._queue.put(tcp_payload)
+
+    def _setup_libpcap(self, device, port):
+        """Setup the pcap object and return the handle for it.
+
+        :returns: pcap.pcapObject
+
+        """
+        # Validate the device
+        if not self._validate_device(device):
+            raise ValueError('Can not validate the device: %s' % device)
+
+        # Create the pcap object
+        pcap_object = pcap.pcapObject()
+
+        # Open the device in promiscuous mode
+        try:
+            pcap_object.open_live(device, _SNAPSHOT_LENGTH, True, _TIMEOUT)
+            self._logger.info('Opened %s', device)
+        except Exception as error:
+            raise OSError('Permission error opening device %s' % error)
+
+        # Set our filter up
+        filter = 'dst port %i' % port
+
+        # Create our pcap filter looking for ip packets for the memcached server
+        pcap_object.setfilter(filter, 1, 0)
+        self._logger.info('Filter set to: %s', filter)
+
+        # Set our operation to non-blocking
+        pcap_object.setnonblock(1)
+
+        # Return the handle to the pcap object
+        return pcap_object
+
+    def _tcp_decode(self, packet_in):
+        """Extract the TCP header and populate a dictionary of values, returning
+        a the dictionary and the remaining data to extract.
+
+        :param str packet_in: The TCP packet data
+        :returns: tuple
+
+        """
+        self._logger.debug('TCP Packet: %r', packet_in)
+        out = {'source_port': ntohs(struct.unpack('H', packet_in[0:2])[0]),
+               'dest_port': ntohs(struct.unpack('H', packet_in[2:4])[0]),
+               'data_offset': struct.unpack('B', packet_in[12])[0] >> 4}
+        return out, self._char_conversion(packet_in[(_TCP_BASE_HEADER_SIZE +
+                                                     out['data_offset']):])
+
+    def _validate_device(self, device_name):
+        """Validate the given device name as being available to the application.
+        While this is more hoops than just pcap.lookupdev, we can get a full
+        list of ip addresses we're listening for from this method.
+
+        :param str device_name: The device name to validate
+        :returns: Bool
+
+        """
+        # Get all the devices available
+        devices = pcap.findalldevs()
+
+        # Iterate through the devices looking for the one we care about
+        for device in devices:
+
+            # Is this the droid, err device we are looking for?
+            if device[0] == device_name:
+                self._logger.debug('Validated device %s', device_name)
+
+                # Output ip addresses if there are any
+                if device[2]:
+                    ip_addresses = list()
+                    for address_info in device[2]:
+                        ip_addresses.append(address_info[0])
+                    self._logger.info('IP addresses to listen on: %r',
+                                      ip_addresses)
+
+                # Device validates
+                return True
+
+        # It was not found
+        return False
+
+    def process(self):
+        """Start processing packets, dispatching received packets to the
+        TCPCapture._process_raw_data method.
+
+        Will loop as long as self._running is True
+
+        """
+        # We want to process
+        self._running = True
+
+        # Iterate as long as we're processing
+        while self._running:
+
+            # Dispatch the reading of packets, as many as we can get
+            self._pcap.dispatch(1, self._process_packet)
+
+    def stop(self):
+        """Causes the blocking listen call to stop."""
+        # Toggle the bool looped on in the listen method
+        self._running = False
+
+        # Log that the processing has been told to stop
+        self._logger.info('Indicated that processing of packets should stop')
